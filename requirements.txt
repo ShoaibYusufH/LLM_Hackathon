@@ -1,0 +1,13 @@
+Django==5.2.5
+djangorestframework==3.14.0
+django-cors-headers==4.3.1
+psycopg2-binary==2.9.7
+pgvector==0.2.4
+sentence-transformers==2.2.2
+torch==2.1.0
+numpy==1.24.3
+requests==2.31.0
+beautifulsoup4==4.12.2
+GitPython==3.1.40
+langchain==0.0.350
+langchain-community==0.0.10
