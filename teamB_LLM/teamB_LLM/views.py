@@ -1,6 +1,5 @@
 import json
 import uuid
-import asyncio
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
@@ -12,7 +11,7 @@ from rest_framework.response import Response
 from rest_framework import status
 
 from .services import rag_service
-from .models import ChatSession, Message, DataSource
+from .models import ChatSession, Message, DataSource, Document
 
 # ==================== CHAT ENDPOINTS ====================
 
@@ -21,14 +20,12 @@ from .models import ChatSession, Message, DataSource
 def create_chat_session(request):
     """Create a new chat session"""
     try:
-        session_id = str(uuid.uuid4())
         chat_session = ChatSession.objects.create(
-            session_id=session_id,
             user=request.user if request.user.is_authenticated else None
         )
         
         return Response({
-            'session_id': session_id,
+            'session_id': str(chat_session.session_id),
             'created_at': chat_session.created_at.isoformat()
         }, status=status.HTTP_201_CREATED)
         
@@ -46,8 +43,9 @@ def get_chat_sessions(request):
             sessions = ChatSession.objects.all()[:10]  # Limit for demo
             
         sessions_data = [{
-            'session_id': session.session_id,
+            'session_id': str(session.session_id),
             'created_at': session.created_at.isoformat(),
+            'updated_at': session.updated_at.isoformat(),
             'message_count': session.messages.count()
         } for session in sessions.order_by('-created_at')]
         
@@ -71,7 +69,7 @@ def get_chat_history(request, session_id):
         } for msg in messages]
         
         return Response({
-            'session_id': session_id,
+            'session_id': str(session_id),
             'messages': messages_data
         })
         
@@ -175,26 +173,20 @@ def ingest_github_repo(request):
             status='processing'
         )
         
+        # Process repository
         try:
-            # Process repository
             doc_count = rag_service.ingest_github_repo(repo_url, repo_name)
-            
-            # Update status
-            data_source.status = 'completed'
-            data_source.document_count = doc_count
-            data_source.save()
-            
-            return Response({
-                'id': data_source.id,
-                'message': f'Successfully ingested {doc_count} documents from {repo_name}',
-                'doc_count': doc_count,
-                'status': 'completed'
-            })
-            
         except Exception as e:
             data_source.status = 'failed'
             data_source.save()
-            raise e
+            return Response({'error': f'Failed to ingest repository: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+        return Response({
+            'id': data_source.id,
+            'message': f'Successfully ingested {doc_count} documents from {repo_name}',
+            'doc_count': doc_count,
+            'status': 'completed'
+        })
             
     except Exception as e:
         return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -220,12 +212,7 @@ def ingest_web_documents(request):
         
         try:
             # Process URLs
-            doc_count = rag_service.ingest_web_documents(urls)
-            
-            # Update status
-            data_source.status = 'completed'
-            data_source.document_count = doc_count
-            data_source.save()
+            doc_count = rag_service.ingest_web_documents(urls, name)
             
             return Response({
                 'id': data_source.id,
@@ -235,9 +222,7 @@ def ingest_web_documents(request):
             })
             
         except Exception as e:
-            data_source.status = 'failed'
-            data_source.save()
-            raise e
+            return Response({'error': f'Failed to ingest web documents: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
             
     except Exception as e:
         return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -255,7 +240,9 @@ def get_data_sources(request):
             'url': source.url,
             'status': source.status,
             'document_count': source.document_count,
-            'created_at': source.created_at.isoformat()
+            'created_at': source.created_at.isoformat(),
+            'updated_at': source.updated_at.isoformat(),
+            'metadata': source.metadata
         } for source in sources]
         
         return Response({'sources': sources_data})
@@ -269,10 +256,17 @@ def delete_data_source(request, source_id):
     """Delete a data source"""
     try:
         source = DataSource.objects.get(id=source_id)
+        
+        # Delete associated documents
+        deleted_docs = rag_service.delete_source_documents(source_id)
+        
+        # Delete the source
         source.delete()
         
-        # Note: This doesn't remove from vector store - you might want to implement that
-        return Response({'message': 'Data source deleted successfully'})
+        return Response({
+            'message': 'Data source deleted successfully',
+            'deleted_documents': deleted_docs
+        })
         
     except DataSource.DoesNotExist:
         return Response({'error': 'Data source not found'}, status=status.HTTP_404_NOT_FOUND)
@@ -298,7 +292,8 @@ def search_documents(request):
         results = [{
             'content': doc.page_content[:500] + '...' if len(doc.page_content) > 500 else doc.page_content,
             'metadata': doc.metadata,
-            'relevance_score': getattr(doc, 'relevance_score', None)
+            'similarity_score': doc.metadata.get('similarity_score'),
+            'distance': doc.metadata.get('distance')
         } for doc in docs]
         
         return Response({
@@ -316,25 +311,27 @@ def search_documents(request):
 def health_check(request):
     """Health check endpoint"""
     try:
-        # Check vector store
-        vectorstore = rag_service.get_vectorstore()
-        vector_count = vectorstore._collection.count() if hasattr(vectorstore, '_collection') else 0
+        # Check vector database
+        vector_stats = rag_service.get_stats()
         
         # Check database
         total_sources = DataSource.objects.count()
         active_sources = DataSource.objects.filter(status='completed').count()
         total_sessions = ChatSession.objects.count()
+        total_documents = Document.objects.count()
         
         return Response({
             'status': 'healthy',
-            'vector_store': {
+            'vector_database': {
                 'status': 'connected',
-                'document_count': vector_count
+                'document_count': total_documents,
+                'embedding_dimension': vector_stats.get('embedding_dimension')
             },
             'database': {
                 'total_sources': total_sources,
                 'active_sources': active_sources,
-                'total_sessions': total_sessions
+                'total_sessions': total_sessions,
+                'total_documents': total_documents
             }
         })
         
@@ -348,6 +345,8 @@ def health_check(request):
 def get_stats(request):
     """Get system statistics"""
     try:
+        vector_stats = rag_service.get_stats()
+        
         stats = {
             'data_sources': {
                 'total': DataSource.objects.count(),
@@ -362,7 +361,8 @@ def get_stats(request):
                 'total_messages': Message.objects.count(),
                 'user_messages': Message.objects.filter(is_user=True).count(),
                 'bot_messages': Message.objects.filter(is_user=False).count()
-            }
+            },
+            'vector_database': vector_stats
         }
         
         return Response(stats)
@@ -390,7 +390,9 @@ def batch_ingest(request):
             
             if source_type == 'github':
                 try:
-                    result = ingest_github_repo(request)
+                    # Create a mock request with the source data
+                    mock_request = type('MockRequest', (), {'data': source})()
+                    result = ingest_github_repo(mock_request)
                     results.append({
                         'source': source,
                         'status': 'success',
@@ -405,7 +407,9 @@ def batch_ingest(request):
             
             elif source_type == 'web':
                 try:
-                    result = ingest_web_documents(request)
+                    # Create a mock request with the source data
+                    mock_request = type('MockRequest', (), {'data': source})()
+                    result = ingest_web_documents(mock_request)
                     results.append({
                         'source': source,
                         'status': 'success',
